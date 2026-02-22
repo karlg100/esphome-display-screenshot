@@ -50,6 +50,7 @@ enum PageMode {
 enum CaptureBackend {
   BACKEND_DISPLAY_BUFFER,  ///< Standard DisplayBuffer (ILI9XXX, ST7789V, etc.)
   BACKEND_RPI_DPI_RGB,     ///< rpi_dpi_rgb (ESP32-S3 RGB LCD panels)
+  BACKEND_INKPLATE,        ///< inkplate (all Inkplate e-paper models)
 };
 
 /// HTTP handler that captures the display framebuffer as a BMP image.
@@ -89,6 +90,10 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
   void set_backend(const std::string &backend) {
     if (backend == "rpi_dpi_rgb") {
       this->backend_ = BACKEND_RPI_DPI_RGB;
+      return;
+    }
+    if (backend == "inkplate") {
+      this->backend_ = BACKEND_INKPLATE;
       return;
     }
     this->backend_ = BACKEND_DISPLAY_BUFFER;

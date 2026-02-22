@@ -101,7 +101,10 @@ curl http://<YOUR-DEVICE-IP>/screenshot/info
 ## Requirements
 
 - **ESP32 with PSRAM** -- ESP32-S3, ESP32-S2, or ESP32 WROVER. The ~225 KB BMP buffer is allocated in PSRAM. Regular ESP32 without PSRAM won't work.
-- **Display using RGB565** -- any `DisplayBuffer` subclass in `BITS_16` colour mode (ILI9XXX, ST7789V, ILI9341, ILI9488, etc.), or `rpi_dpi_rgb` displays when `backend: rpi_dpi_rgb` is set
+- **Supported framebuffer backends**
+  - `display_buffer` (default): RGB565 (`BITS_16`) `DisplayBuffer` displays (ILI9XXX, ST7789V, ILI9341, ILI9488, etc.)
+  - `rpi_dpi_rgb`: ESP32-S3 RGB LCD panels (`rpi_dpi_rgb`)
+  - `inkplate`: all ESPHome Inkplate models (1-bit and grayscale modes)
 - **`web_server` component enabled** -- the screenshot endpoint hooks into ESPHome's built-in web server
 
 ---
@@ -181,6 +184,7 @@ Pick the config that matches your setup (see [Which page mode do I need?](#which
 display_capture:
   display_id: my_display  # <-- change to match YOUR display's id
   # backend: rpi_dpi_rgb  # uncomment for rpi_dpi_rgb displays (ESP32-S3 RGB LCD panels)
+  # backend: inkplate     # uncomment for Inkplate e-paper displays
 ```
 
 ### 5. Compile, upload, and test
@@ -359,7 +363,7 @@ curl http://<YOUR-DEVICE-IP>/screenshot/info
 | `page_global` | ID | No | `globals` int that tracks the current page |
 | `sleep_global` | ID | No | `globals` bool -- wakes display before capture |
 | `page_names` | list of strings | No | Human-readable names for the `/screenshot/info` endpoint |
-| `backend` | string | No | Framebuffer backend: `display_buffer` (default) or `rpi_dpi_rgb` for ESP32-S3 RGB LCD panels |
+| `backend` | string | No | Framebuffer backend: `display_buffer` (default), `rpi_dpi_rgb` (ESP32-S3 RGB LCD), or `inkplate` (all Inkplate e-paper models) |
 
 ---
 
@@ -405,7 +409,12 @@ If you're not using sleep, check that your display lambda is actually drawing so
 
 ### Screenshot colours look wrong
 
-The component assumes RGB565 (BITS_16) buffer format, which is the default for ILI9XXX displays. If your display uses a different colour mode, the output will be garbled.
+The component expects a backend-specific framebuffer format:
+
+- `display_buffer` and `rpi_dpi_rgb`: RGB565 (`BITS_16`)
+- `inkplate`: packed Inkplate framebuffer (1-bit or grayscale)
+
+If `backend` doesn't match your display type, the output will be garbled.
 
 ---
 
@@ -449,7 +458,7 @@ The output BMP always matches what you see on the physical display, regardless o
 |---|---|
 | **Tested on** | ST7789V 240x320 @ rotation 90, ESP32-S3 |
 | **ESPHome** | 2025.11.x and later |
-| **Should work with** | Any `DisplayBuffer` subclass in BITS_16 mode, or `rpi_dpi_rgb` displays, on any PSRAM-equipped ESP32 |
+| **Should work with** | Any RGB565 `DisplayBuffer` display, `rpi_dpi_rgb`, and all ESPHome Inkplate models, on any PSRAM-equipped ESP32 |
 
 ## Support
 

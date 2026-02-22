@@ -17,6 +17,9 @@
 #ifdef USE_RPI_DPI_RGB
 #include "esphome/components/rpi_dpi_rgb/rpi_dpi_rgb.h"
 #endif
+#ifdef USE_INKPLATE
+#include "esphome/components/inkplate/inkplate.h"
+#endif
 
 // --- Step 2: Our own header (uses only forward declarations, no buffer access) ---
 #include "display_capture.h"
@@ -55,6 +58,8 @@ void DisplayCaptureHandler::setup() {
   const char *backend_str = "display_buffer";
   if (this->backend_ == BACKEND_RPI_DPI_RGB)
     backend_str = "rpi_dpi_rgb";
+  else if (this->backend_ == BACKEND_INKPLATE)
+    backend_str = "inkplate";
 
   int pages = this->get_page_count();
   if (pages >= 0) {
@@ -356,6 +361,7 @@ void DisplayCaptureHandler::generate_bmp_() {
   // --- Pixel data ---
   // Get the framebuffer pointer using the configured backend.
   uint8_t *buf = nullptr;
+  bool inkplate_greyscale = false;
   if (this->backend_ == BACKEND_RPI_DPI_RGB) {
 #ifdef USE_RPI_DPI_RGB
     auto *rgb_display = static_cast<rpi_dpi_rgb::RpiDpiRgb *>(this->display_);
@@ -378,6 +384,18 @@ void DisplayCaptureHandler::generate_bmp_() {
     buf = static_cast<uint8_t *>(fb);
 #else
     ESP_LOGE(TAG, "rpi_dpi_rgb backend requested but USE_RPI_DPI_RGB is not enabled in this build");
+    heap_caps_free(this->bmp_data_);
+    this->bmp_data_ = nullptr;
+    this->bmp_size_ = 0;
+    return;
+#endif
+  } else if (this->backend_ == BACKEND_INKPLATE) {
+#ifdef USE_INKPLATE
+    auto *ink_display = static_cast<inkplate::Inkplate *>(this->display_);
+    buf = ink_display->buffer_;
+    inkplate_greyscale = ink_display->get_greyscale();
+#else
+    ESP_LOGE(TAG, "inkplate backend requested but USE_INKPLATE is not enabled in this build");
     heap_caps_free(this->bmp_data_);
     this->bmp_data_ = nullptr;
     this->bmp_size_ = 0;
@@ -434,22 +452,47 @@ void DisplayCaptureHandler::generate_bmp_() {
           break;
       }
 
-      // Decode RGB565 pixel (2 bytes per pixel in BITS_16 mode):
-      //
-      //   byte[0] = RRRRRGGG  (high byte: 5 bits red, upper 3 bits green)
-      //   byte[1] = GGGBBBBB  (low byte: lower 3 bits green, 5 bits blue)
-      //
-      // Expand to 8-bit per channel with proper scaling (not just shifting).
-      uint32_t pos = (by * w_int + bx) * 2;
-      uint8_t high = buf[pos];
-      uint8_t low = buf[pos + 1];
+      uint8_t r, g, b;
+      if (this->backend_ == BACKEND_INKPLATE) {
+        if (inkplate_greyscale) {
+          // Inkplate grayscale mode stores two 3-bit pixels per byte:
+          // high nibble for even x, low nibble for odd x.
+          uint32_t pos = (by * w_int + bx) / 2;
+          uint8_t packed = buf[pos];
+          uint8_t gs = (bx & 1) ? (packed & 0x0F) : (packed >> 4);
+          gs &= 0x07;
+          uint8_t v = (gs * 255) / 7;
+          r = v;
+          g = v;
+          b = v;
+        } else {
+          // Inkplate 1-bit mode stores 8 pixels per byte. Bit=1 is white,
+          // bit=0 is black in the framebuffer.
+          uint32_t pos = by * (w_int / 8) + (bx / 8);
+          uint8_t mask = static_cast<uint8_t>(0x80 >> (bx & 7));
+          uint8_t v = (buf[pos] & mask) ? 255 : 0;
+          r = v;
+          g = v;
+          b = v;
+        }
+      } else {
+        // Decode RGB565 pixel (2 bytes per pixel in BITS_16 mode):
+        //
+        //   byte[0] = RRRRRGGG  (high byte: 5 bits red, upper 3 bits green)
+        //   byte[1] = GGGBBBBB  (low byte: lower 3 bits green, 5 bits blue)
+        //
+        // Expand to 8-bit per channel with proper scaling (not just shifting).
+        uint32_t pos = (by * w_int + bx) * 2;
+        uint8_t high = buf[pos];
+        uint8_t low = buf[pos + 1];
 
-      uint8_t r5 = high >> 3;
-      uint8_t g6 = ((high & 0x07) << 3) | (low >> 5);
-      uint8_t b5 = low & 0x1F;
-      uint8_t r = (r5 * 255) / 31;
-      uint8_t g = (g6 * 255) / 63;
-      uint8_t b = (b5 * 255) / 31;
+        uint8_t r5 = high >> 3;
+        uint8_t g6 = ((high & 0x07) << 3) | (low >> 5);
+        uint8_t b5 = low & 0x1F;
+        r = (r5 * 255) / 31;
+        g = (g6 * 255) / 63;
+        b = (b5 * 255) / 31;
+      }
 
       // BMP pixel order is BGR (not RGB)
       row_ptr[sx * 3 + 0] = b;
