@@ -17,7 +17,7 @@
 #ifdef USE_RPI_DPI_RGB
 #include "esphome/components/rpi_dpi_rgb/rpi_dpi_rgb.h"
 #endif
-#ifdef USE_INKPLATE
+#ifdef DISPLAY_CAPTURE_USE_INKPLATE
 #include "esphome/components/inkplate/inkplate.h"
 #endif
 
@@ -390,12 +390,12 @@ void DisplayCaptureHandler::generate_bmp_() {
     return;
 #endif
   } else if (this->backend_ == BACKEND_INKPLATE) {
-#ifdef USE_INKPLATE
+#ifdef DISPLAY_CAPTURE_USE_INKPLATE
     auto *ink_display = static_cast<inkplate::Inkplate *>(this->display_);
     buf = ink_display->buffer_;
     inkplate_greyscale = ink_display->get_greyscale();
 #else
-    ESP_LOGE(TAG, "inkplate backend requested but USE_INKPLATE is not enabled in this build");
+    ESP_LOGE(TAG, "inkplate backend requested but DISPLAY_CAPTURE_USE_INKPLATE is not enabled in this build");
     heap_caps_free(this->bmp_data_);
     this->bmp_data_ = nullptr;
     this->bmp_size_ = 0;

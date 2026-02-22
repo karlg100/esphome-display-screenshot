@@ -89,6 +89,9 @@ async def to_code(config):
             pages.append(page_var)
         cg.add(var.set_pages(pages))
 
+    if config[CONF_BACKEND] == BACKEND_INKPLATE:
+        cg.add_define("DISPLAY_CAPTURE_USE_INKPLATE")
+
     # Globals support is conditionally compiled. ESPHome only includes a
     # component's headers in the build when that component is used, so the
     # globals_component.h header won't exist in builds without globals.
