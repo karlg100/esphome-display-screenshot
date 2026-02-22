@@ -100,7 +100,7 @@ curl http://<YOUR-DEVICE-IP>/screenshot/info
 
 ## Requirements
 
-- **ESP32 with PSRAM** -- ESP32-S3, ESP32-S2, or ESP32 WROVER. The ~225 KB BMP buffer is allocated in PSRAM. Regular ESP32 without PSRAM won't work.
+- **ESP32** -- PSRAM is recommended, but optional. The component needs enough free RAM for a full BMP buffer (~225 KB at 320x240). By default it prefers PSRAM and falls back to internal RAM.
 - **Display using RGB565** -- any `DisplayBuffer` subclass in `BITS_16` colour mode (ILI9XXX, ST7789V, ILI9341, ILI9488, etc.), or `rpi_dpi_rgb` displays when `backend: rpi_dpi_rgb` is set
 - **`web_server` component enabled** -- the screenshot endpoint hooks into ESPHome's built-in web server
 
@@ -181,6 +181,7 @@ Pick the config that matches your setup (see [Which page mode do I need?](#which
 display_capture:
   display_id: my_display  # <-- change to match YOUR display's id
   # backend: rpi_dpi_rgb  # uncomment for rpi_dpi_rgb displays (ESP32-S3 RGB LCD panels)
+  # memory: auto          # auto (default), psram, or internal
 ```
 
 ### 5. Compile, upload, and test
@@ -345,7 +346,7 @@ curl http://<YOUR-DEVICE-IP>/screenshot/info
 | Code | Meaning |
 |------|---------|
 | 200 | Success -- BMP or JSON returned |
-| 500 | PSRAM allocation failed (device out of memory) |
+| 500 | BMP allocation failed (device out of memory for selected memory mode) |
 | 504 | Main loop didn't respond in 5 seconds (device too busy) |
 
 ---
@@ -360,6 +361,7 @@ curl http://<YOUR-DEVICE-IP>/screenshot/info
 | `sleep_global` | ID | No | `globals` bool -- wakes display before capture |
 | `page_names` | list of strings | No | Human-readable names for the `/screenshot/info` endpoint |
 | `backend` | string | No | Framebuffer backend: `display_buffer` (default) or `rpi_dpi_rgb` for ESP32-S3 RGB LCD panels |
+| `memory` | string | No | BMP buffer allocation strategy: `auto` (default, PSRAM then internal), `psram`, or `internal` |
 
 ---
 
@@ -386,7 +388,14 @@ The main ESPHome loop didn't respond within 5 seconds. This usually means:
 
 ### 500 error on `/screenshot`
 
-PSRAM allocation failed. Check that your board actually has PSRAM and it's enabled in your board config. For ESP32-S3, you may need:
+BMP allocation failed for the selected memory mode. Try one of these:
+
+- Set `memory: auto` (default) so it can fall back to internal RAM when PSRAM isn't available.
+- Set `memory: internal` explicitly on boards without PSRAM.
+- Reduce display resolution to lower BMP size.
+- Free RAM elsewhere (disable unneeded components/logging).
+
+If you're expecting PSRAM, verify that your board actually has it and it's enabled. For ESP32-S3, you may need:
 
 ```yaml
 esp32:
@@ -425,12 +434,12 @@ handleRequest()
                                            wake display if sleeping
                                            switch to requested page
                                            display_->update()
-                                           read buffer -> BMP in PSRAM
+                                           read buffer -> BMP in configured RAM
                                            restore original page + sleep
                                            xSemaphoreGive() ---+
   semaphore acquired  <------------------------------------|
   send BMP response
-  free PSRAM buffer
+  free BMP buffer
 ```
 
 ### Protected Buffer Access
@@ -449,7 +458,7 @@ The output BMP always matches what you see on the physical display, regardless o
 |---|---|
 | **Tested on** | ST7789V 240x320 @ rotation 90, ESP32-S3 |
 | **ESPHome** | 2025.11.x and later |
-| **Should work with** | Any `DisplayBuffer` subclass in BITS_16 mode, or `rpi_dpi_rgb` displays, on any PSRAM-equipped ESP32 |
+| **Should work with** | Any `DisplayBuffer` subclass in BITS_16 mode, or `rpi_dpi_rgb` displays, on ESP32 boards with enough free RAM (PSRAM recommended) |
 
 ## Support
 

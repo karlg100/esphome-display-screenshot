@@ -52,6 +52,13 @@ enum CaptureBackend {
   BACKEND_RPI_DPI_RGB,     ///< rpi_dpi_rgb (ESP32-S3 RGB LCD panels)
 };
 
+/// How BMP memory is allocated.
+enum MemoryMode {
+  MEMORY_AUTO,      ///< Prefer PSRAM, fall back to internal RAM
+  MEMORY_PSRAM,     ///< PSRAM only
+  MEMORY_INTERNAL,  ///< Internal RAM only
+};
+
 /// HTTP handler that captures the display framebuffer as a BMP image.
 ///
 /// Registers two endpoints on the device's existing web server:
@@ -94,6 +101,18 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
     this->backend_ = BACKEND_DISPLAY_BUFFER;
   }
 
+  void set_memory_mode(const std::string &memory_mode) {
+    if (memory_mode == "psram") {
+      this->memory_mode_ = MEMORY_PSRAM;
+      return;
+    }
+    if (memory_mode == "internal") {
+      this->memory_mode_ = MEMORY_INTERNAL;
+      return;
+    }
+    this->memory_mode_ = MEMORY_AUTO;
+  }
+
   // --- AsyncWebHandler interface ---
 
   bool canHandle(AsyncWebServerRequest *request) const override {
@@ -125,7 +144,7 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
   void handle_screenshot_(AsyncWebServerRequest *req);
   /// Handles GET /screenshot/info -- returns JSON, no semaphore needed.
   void handle_info_(AsyncWebServerRequest *req);
-  /// Reads the display buffer and generates a 24-bit BMP in PSRAM.
+  /// Reads the display buffer and generates a 24-bit BMP in configured memory.
   void generate_bmp_();
 
   /// Write a 32-bit value in little-endian byte order (for BMP headers).
@@ -151,6 +170,7 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
 
   PageMode page_mode_{SINGLE};
   CaptureBackend backend_{BACKEND_DISPLAY_BUFFER};  ///< Framebuffer extraction backend
+  MemoryMode memory_mode_{MEMORY_AUTO};             ///< BMP allocation strategy
   std::vector<display::DisplayPage *> pages_;       ///< Native page pointers (NATIVE_PAGES mode)
   std::vector<std::string> page_names_;             ///< Human-readable names for /info endpoint
 
@@ -162,7 +182,7 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
   SemaphoreHandle_t semaphore_{nullptr};   ///< Coordinates HTTP task <-> main loop handoff
   volatile bool request_pending_{false};   ///< Flag: HTTP task has a pending screenshot request
   volatile int requested_page_{-1};        ///< Which page to capture (-1 = current)
-  uint8_t *bmp_data_{nullptr};             ///< PSRAM buffer holding the generated BMP
+  uint8_t *bmp_data_{nullptr};             ///< Buffer holding the generated BMP
   size_t bmp_size_{0};                     ///< Size of the BMP data in bytes
 };
 
