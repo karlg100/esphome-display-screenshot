@@ -56,11 +56,17 @@ void DisplayCaptureHandler::setup() {
   if (this->backend_ == BACKEND_RPI_DPI_RGB)
     backend_str = "rpi_dpi_rgb";
 
+  const char *memory_str = "auto";
+  if (this->memory_mode_ == MEMORY_PSRAM)
+    memory_str = "psram";
+  else if (this->memory_mode_ == MEMORY_INTERNAL)
+    memory_str = "internal";
+
   int pages = this->get_page_count();
   if (pages >= 0) {
-    ESP_LOGI(TAG, "Display capture registered at /screenshot (mode: %s, backend: %s, pages: %d)", mode_str, backend_str, pages);
+    ESP_LOGI(TAG, "Display capture registered at /screenshot (mode: %s, backend: %s, memory: %s, pages: %d)", mode_str, backend_str, memory_str, pages);
   } else {
-    ESP_LOGI(TAG, "Display capture registered at /screenshot (mode: %s, backend: %s, pages: unknown)", mode_str, backend_str);
+    ESP_LOGI(TAG, "Display capture registered at /screenshot (mode: %s, backend: %s, memory: %s, pages: unknown)", mode_str, backend_str, memory_str);
   }
 }
 
@@ -290,7 +296,7 @@ void DisplayCaptureHandler::handle_info_(AsyncWebServerRequest *req) {
 // ============================================================================
 //
 // Reads the display's internal RGB565 framebuffer and generates a standard
-// 24-bit uncompressed BMP (BITMAPINFOHEADER format) in PSRAM.
+// 24-bit uncompressed BMP (BITMAPINFOHEADER format).
 //
 // Key details:
 //   - Uses static_cast to access DisplayBuffer::buffer_ (dynamic_cast is
@@ -327,14 +333,33 @@ void DisplayCaptureHandler::generate_bmp_() {
   uint32_t pixel_data_size = row_stride * screen_h;
   uint32_t file_size = 54 + pixel_data_size;  // 14 (file header) + 40 (DIB header) + pixels
 
-  // Allocate in PSRAM (external SPI RAM) -- ~225 KB for 320x240.
-  // Internal SRAM is only ~320 KB total and mostly used by the framework.
-  this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+  bool allocated_from_psram = false;
+  switch (this->memory_mode_) {
+    case MEMORY_PSRAM:
+      this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+      allocated_from_psram = this->bmp_data_ != nullptr;
+      break;
+    case MEMORY_INTERNAL:
+      this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      break;
+    case MEMORY_AUTO:
+    default:
+      this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+      if (this->bmp_data_ != nullptr) {
+        allocated_from_psram = true;
+      } else {
+        this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      }
+      break;
+  }
   if (this->bmp_data_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to allocate %u bytes in PSRAM for BMP", file_size);
+    ESP_LOGE(TAG, "Failed to allocate %u bytes for BMP (memory mode: %s)", file_size,
+             this->memory_mode_ == MEMORY_PSRAM ? "psram" :
+             this->memory_mode_ == MEMORY_INTERNAL ? "internal" : "auto");
     this->bmp_size_ = 0;
     return;
   }
+  ESP_LOGD(TAG, "Allocated %u bytes for BMP from %s RAM", file_size, allocated_from_psram ? "PSRAM" : "internal");
   this->bmp_size_ = file_size;
 
   memset(this->bmp_data_, 0, 54);
