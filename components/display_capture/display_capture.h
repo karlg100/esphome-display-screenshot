@@ -63,7 +63,7 @@ enum MemoryMode {
 ///
 /// Registers two endpoints on the device's existing web server:
 ///   GET /screenshot[?page=N]  -- returns a BMP of the display (24-bit preferred,
-///                                16-bit RGB565 fallback if memory is tight)
+///                                then 16-bit RGB565, then 8-bit indexed fallback)
 ///   GET /screenshot/info      -- returns JSON metadata (page count, dimensions, mode)
 ///
 /// Thread safety: the /screenshot endpoint uses a binary semaphore to hand off

@@ -296,8 +296,8 @@ void DisplayCaptureHandler::handle_info_(AsyncWebServerRequest *req) {
 // ============================================================================
 //
 // Reads the display's internal RGB565 framebuffer and generates a BMP.
-// Prefers 24-bit output and falls back to 16-bit RGB565 (BITFIELDS)
-// when memory is too tight for the 24-bit buffer.
+// Prefers 24-bit output and falls back to 16-bit RGB565 (BITFIELDS), then
+// 8-bit indexed color, when memory is too tight.
 //
 // Key details:
 //   - Uses static_cast to access DisplayBuffer::buffer_ (dynamic_cast is
@@ -353,7 +353,7 @@ void DisplayCaptureHandler::generate_bmp_() {
     return this->bmp_data_ != nullptr;
   };
 
-  // Prefer 24-bit BMP; if that fails, try 16-bit RGB565 BMP.
+  // Prefer 24-bit BMP; if that fails, try 16-bit RGB565 BMP; then 8-bit indexed BMP.
   int bits_per_pixel = 24;
   int bytes_per_pixel = 3;
   int row_stride = ((screen_w * bytes_per_pixel + 3) / 4) * 4;
@@ -362,6 +362,7 @@ void DisplayCaptureHandler::generate_bmp_() {
   uint32_t file_size = pixel_data_offset + pixel_data_size;
   bool allocated_from_psram = false;
   uint32_t attempted_24bit_size = file_size;
+  uint32_t attempted_16bit_size = 0;
 
   if (!alloc_for_bmp(file_size, allocated_from_psram)) {
     bits_per_pixel = 16;
@@ -371,15 +372,28 @@ void DisplayCaptureHandler::generate_bmp_() {
     pixel_data_size = row_stride * screen_h;
     file_size = pixel_data_offset + pixel_data_size;
 
+    attempted_16bit_size = file_size;
     if (!alloc_for_bmp(file_size, allocated_from_psram)) {
-      ESP_LOGE(TAG, "Failed to allocate BMP (%u bytes for 24-bit, %u bytes for 16-bit, memory mode: %s)",
-               attempted_24bit_size, file_size,
-               this->memory_mode_ == MEMORY_PSRAM ? "psram" :
-               this->memory_mode_ == MEMORY_INTERNAL ? "internal" : "auto");
-      this->bmp_size_ = 0;
-      return;
+      bits_per_pixel = 8;
+      bytes_per_pixel = 1;
+      row_stride = ((screen_w * bytes_per_pixel + 3) / 4) * 4;
+      pixel_data_offset = 54 + (256 * 4);  // + 256-color palette
+      pixel_data_size = row_stride * screen_h;
+      file_size = pixel_data_offset + pixel_data_size;
+
+      if (!alloc_for_bmp(file_size, allocated_from_psram)) {
+        ESP_LOGE(TAG,
+                 "Failed to allocate BMP (%u bytes for 24-bit, %u bytes for 16-bit, %u bytes for 8-bit, memory mode: %s)",
+                 attempted_24bit_size, attempted_16bit_size, file_size,
+                 this->memory_mode_ == MEMORY_PSRAM ? "psram" :
+                 this->memory_mode_ == MEMORY_INTERNAL ? "internal" : "auto");
+        this->bmp_size_ = 0;
+        return;
+      }
+      ESP_LOGW(TAG, "24-bit and 16-bit BMP allocation failed; falling back to 8-bit BMP (%u bytes)", file_size);
+    } else {
+      ESP_LOGW(TAG, "24-bit BMP allocation failed; falling back to 16-bit RGB565 BMP (%u bytes)", file_size);
     }
-    ESP_LOGW(TAG, "24-bit BMP allocation failed; falling back to 16-bit RGB565 BMP (%u bytes)", file_size);
   }
 
   ESP_LOGD(TAG, "Allocated %u bytes for %d-bit BMP from %s RAM",
@@ -400,14 +414,31 @@ void DisplayCaptureHandler::generate_bmp_() {
   write_le32_(this->bmp_data_ + 22, screen_h);   // height (positive = bottom-up)
   write_le16_(this->bmp_data_ + 26, 1);          // color planes
   write_le16_(this->bmp_data_ + 28, bits_per_pixel);
-  write_le32_(this->bmp_data_ + 30, bits_per_pixel == 16 ? 3 : 0);  // BI_BITFIELDS for RGB565
+  write_le32_(this->bmp_data_ + 30, bits_per_pixel == 16 ? 3 : 0);  // BI_BITFIELDS for RGB565, BI_RGB otherwise
   write_le32_(this->bmp_data_ + 34, pixel_data_size);
+  write_le32_(this->bmp_data_ + 46, bits_per_pixel == 8 ? 256 : 0);  // color table size
+  write_le32_(this->bmp_data_ + 50, bits_per_pixel == 8 ? 256 : 0);  // important colors
 
   // Channel masks for 16-bit BI_BITFIELDS BMP (RGB565).
   if (bits_per_pixel == 16) {
     write_le32_(this->bmp_data_ + 54, 0xF800);
     write_le32_(this->bmp_data_ + 58, 0x07E0);
     write_le32_(this->bmp_data_ + 62, 0x001F);
+  } else if (bits_per_pixel == 8) {
+    // 8-bit BMP palette using RGB332 mapping.
+    for (int i = 0; i < 256; i++) {
+      uint8_t r3 = (i >> 5) & 0x07;
+      uint8_t g3 = (i >> 2) & 0x07;
+      uint8_t b2 = i & 0x03;
+      uint8_t r = (r3 * 255) / 7;
+      uint8_t g = (g3 * 255) / 7;
+      uint8_t b = (b2 * 255) / 3;
+      int p = 54 + i * 4;
+      this->bmp_data_[p + 0] = b;
+      this->bmp_data_[p + 1] = g;
+      this->bmp_data_[p + 2] = r;
+      this->bmp_data_[p + 3] = 0;
+    }
   }
 
   // --- Pixel data ---
@@ -499,6 +530,13 @@ void DisplayCaptureHandler::generate_bmp_() {
         // 16-bit pixels little-endian.
         row_ptr[sx * 2 + 0] = low;
         row_ptr[sx * 2 + 1] = high;
+      } else if (bits_per_pixel == 8) {
+        // Quantize RGB565 to RGB332 palette index.
+        uint8_t r3 = (high >> 3) >> 2;  // r5 -> r3
+        uint8_t g6 = ((high & 0x07) << 3) | (low >> 5);
+        uint8_t g3 = g6 >> 3;           // g6 -> g3
+        uint8_t b2 = (low & 0x1F) >> 3; // b5 -> b2
+        row_ptr[sx] = (r3 << 5) | (g3 << 2) | b2;
       } else {
         // Decode RGB565 pixel (2 bytes per pixel in BITS_16 mode):
         //
