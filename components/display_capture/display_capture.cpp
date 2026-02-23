@@ -29,7 +29,6 @@
 #include "esphome/components/globals/globals_component.h"
 #endif
 
-#include <esp_heap_caps.h>
 #include <cstring>
 
 namespace esphome {
@@ -43,6 +42,7 @@ void DisplayCaptureHandler::setup() {
   // Binary semaphore for HTTP task <-> main loop synchronization.
   // The HTTP handler takes it (blocks), the main loop gives it (unblocks).
   this->semaphore_ = xSemaphoreCreateBinary();
+  this->stream_chunk_done_ = xSemaphoreCreateBinary();
   this->base_->init();
   this->base_->add_handler(this);
 
@@ -56,17 +56,11 @@ void DisplayCaptureHandler::setup() {
   if (this->backend_ == BACKEND_RPI_DPI_RGB)
     backend_str = "rpi_dpi_rgb";
 
-  const char *memory_str = "auto";
-  if (this->memory_mode_ == MEMORY_PSRAM)
-    memory_str = "psram";
-  else if (this->memory_mode_ == MEMORY_INTERNAL)
-    memory_str = "internal";
-
   int pages = this->get_page_count();
   if (pages >= 0) {
-    ESP_LOGI(TAG, "Display capture registered at /screenshot (mode: %s, backend: %s, memory: %s, pages: %d)", mode_str, backend_str, memory_str, pages);
+    ESP_LOGI(TAG, "Display capture registered at /screenshot (mode: %s, backend: %s, pages: %d)", mode_str, backend_str, pages);
   } else {
-    ESP_LOGI(TAG, "Display capture registered at /screenshot (mode: %s, backend: %s, memory: %s, pages: unknown)", mode_str, backend_str, memory_str);
+    ESP_LOGI(TAG, "Display capture registered at /screenshot (mode: %s, backend: %s, pages: unknown)", mode_str, backend_str);
   }
 }
 
@@ -94,133 +88,101 @@ int DisplayCaptureHandler::get_page_count() const {
 // (where it's safe to touch display state) and signal when done.
 //
 // Sequence:
-//   1. Wake display if sleeping (global pages mode)
-//   2. Switch to requested page (if ?page=N was specified)
-//   3. Render: display_->update()
-//   4. Read buffer into BMP: generate_bmp_()
-//   5. Restore original page and sleep state
-//   6. Re-render to put the display back: display_->update()
-//   7. Signal semaphore -- HTTP task unblocks and sends the BMP
+//   1. Prepare stream snapshot state on main loop (safe display access)
+//   2. HTTP task requests chunk ranges via shared state
+//   3. Main loop fills chunks from framebuffer and signals completion
+//   4. After stream ends, main loop restores page/sleep state
 
 void DisplayCaptureHandler::loop() {
-  if (!this->request_pending_)
-    return;
-  this->request_pending_ = false;
-
-  bool was_sleeping = false;
-  bool page_switched = false;
-
-  // --- Wake display if sleeping ---
-#ifdef DISPLAY_CAPTURE_USE_GLOBALS
-  if (this->sleep_global_ != nullptr && this->sleep_global_->value()) {
-    was_sleeping = true;
-    this->sleep_global_->value() = false;
-  }
-#endif
-
-  // --- Switch to requested page ---
-  if (this->requested_page_ >= 0) {
-    switch (this->page_mode_) {
-      case NATIVE_PAGES: {
-        int idx = this->requested_page_;
-        if (idx >= 0 && idx < (int) this->pages_.size()) {
-          // Save active page so we can restore it after capture.
-          // get_active_page() returns const*, show_page() takes non-const* --
-          // the const_cast in the restore path is safe because we're putting
-          // back a page that was already active.
-          this->saved_native_page_ = this->display_->get_active_page();
-          this->display_->show_page(this->pages_[idx]);
-          page_switched = true;
-        }
-        break;
-      }
-#ifdef DISPLAY_CAPTURE_USE_GLOBALS
-      case GLOBAL_PAGES: {
-        this->saved_global_page_ = this->page_global_->value();
-        if (this->saved_global_page_ != this->requested_page_) {
-          this->page_global_->value() = this->requested_page_;
-          page_switched = true;
-        }
-        break;
-      }
-#endif
-      default:
-        break;
-    }
+  if (this->request_pending_) {
+    this->request_pending_ = false;
+    this->prepare_stream_capture_();
+    xSemaphoreGive(this->semaphore_);
   }
 
-  // --- Render + capture ---
-  this->display_->update();
-  this->generate_bmp_();
-
-  // --- Restore original state ---
-  if (page_switched) {
-    switch (this->page_mode_) {
-      case NATIVE_PAGES:
-        if (this->saved_native_page_ != nullptr) {
-          this->display_->show_page(const_cast<display::DisplayPage *>(this->saved_native_page_));
-        }
-        break;
-#ifdef DISPLAY_CAPTURE_USE_GLOBALS
-      case GLOBAL_PAGES:
-        this->page_global_->value() = this->saved_global_page_;
-        break;
-#endif
-      default:
-        break;
-    }
+  if (this->stream_chunk_requested_) {
+    this->stream_chunk_requested_ = false;
+    this->fill_stream_chunk_();
+    xSemaphoreGive(this->stream_chunk_done_);
   }
 
-#ifdef DISPLAY_CAPTURE_USE_GLOBALS
-  if (was_sleeping) {
-    this->sleep_global_->value() = true;
+  if (this->stream_restore_pending_) {
+    this->finish_stream_capture_();
+    this->stream_restore_pending_ = false;
   }
-#endif
-
-  // Re-render to put the physical display back to its original state.
-  // This causes a brief (~50ms) flash of the captured page on the display.
-  if (page_switched || was_sleeping) {
-    this->display_->update();
-  }
-
-  // Unblock the HTTP handler -- it can now send the BMP response.
-  xSemaphoreGive(this->semaphore_);
 }
 
 // ============================================================================
 // HTTP handlers -- run on the web server's FreeRTOS task
 // ============================================================================
 
-/// Screenshot handler: sets a flag for the main loop and blocks until the
-/// BMP is ready. The 5-second timeout prevents deadlocks if the main loop
-/// is stuck or the component is misconfigured.
-///
-/// IMPORTANT: After req->send(), the web server may still be reading from
-/// bmp_data_ asynchronously (ESPAsyncWebServer on Arduino does not copy
-/// the buffer). We do NOT free the buffer here -- it is freed at the start
-/// of the next generate_bmp_() call, by which time the response is
-/// guaranteed to have been sent. The ~225 KB PSRAM cost between requests
-/// is negligible on devices with 2-8 MB PSRAM.
 void DisplayCaptureHandler::handle_screenshot_(AsyncWebServerRequest *req) {
   int requested_page = -1;
   if (req->hasParam("page")) {
     requested_page = atoi(req->arg("page").c_str());
   }
 
+  if (this->stream_in_progress_) {
+    req->send(429, "text/plain", "Screenshot already in progress");
+    return;
+  }
+
+  this->stream_in_progress_ = true;
   this->requested_page_ = requested_page;
+  this->stream_failed_ = false;
+  this->stream_ready_ = false;
+  this->stream_restore_pending_ = false;
   this->request_pending_ = true;
 
   if (xSemaphoreTake(this->semaphore_, pdMS_TO_TICKS(5000)) == pdTRUE) {
-    if (this->bmp_data_ != nullptr && this->bmp_size_ > 0) {
-      auto *response = req->beginResponse(200, "image/bmp", this->bmp_data_, this->bmp_size_);
+    if (this->stream_ready_ && !this->stream_failed_) {
+      auto *response = req->beginChunkedResponse(
+          "image/bmp",
+          [this](uint8_t *buffer, size_t max_len, size_t index) -> size_t {
+            if (!this->stream_ready_ || this->stream_failed_)
+              return 0;
+            if (index >= this->stream_file_size_) {
+              this->stream_restore_pending_ = true;
+              return 0;
+            }
+
+            size_t len = this->stream_file_size_ - index;
+            if (len > max_len)
+              len = max_len;
+            if (len > STREAM_CHUNK_SIZE)
+              len = STREAM_CHUNK_SIZE;
+
+            // Clear any stale signal from a previous chunk/request.
+            (void) xSemaphoreTake(this->stream_chunk_done_, 0);
+            this->stream_chunk_index_ = index;
+            this->stream_chunk_len_ = len;
+            this->stream_chunk_requested_ = true;
+
+            if (xSemaphoreTake(this->stream_chunk_done_, pdMS_TO_TICKS(5000)) != pdTRUE) {
+              this->stream_failed_ = true;
+              this->stream_restore_pending_ = true;
+              return 0;
+            }
+
+            if (this->stream_chunk_filled_ == 0) {
+              this->stream_failed_ = true;
+              this->stream_restore_pending_ = true;
+              return 0;
+            }
+
+            memcpy(buffer, this->stream_chunk_buf_, this->stream_chunk_filled_);
+            return this->stream_chunk_filled_;
+          });
       response->addHeader("Cache-Control", "no-cache");
       req->send(response);
-      // Buffer is intentionally NOT freed here. See comment above.
     } else {
+      this->stream_restore_pending_ = true;
       req->send(500, "text/plain", "Failed to capture screenshot");
     }
   } else {
     this->request_pending_ = false;
+    this->stream_in_progress_ = false;
+    this->stream_restore_pending_ = true;
     req->send(504, "text/plain", "Screenshot capture timed out");
   }
 }
@@ -292,274 +254,209 @@ void DisplayCaptureHandler::handle_info_(AsyncWebServerRequest *req) {
 }
 
 // ============================================================================
-// BMP generation -- called from loop() on the main task
+// Streaming capture helpers -- all framebuffer access on main loop
 // ============================================================================
-//
-// Reads the display's internal RGB565 framebuffer and generates a BMP.
-// Prefers 24-bit output and falls back to 16-bit RGB565 (BITFIELDS), then
-// 8-bit indexed color, when memory is too tight.
-//
-// Key details:
-//   - Uses static_cast to access DisplayBuffer::buffer_ (dynamic_cast is
-//     unavailable because ESP-IDF builds with -fno-rtti)
-//   - Handles all four display rotations by applying the inverse of
-//     ESPHome's draw_pixel_at() rotation transform
-//   - RGB565 (2 bytes/pixel) -> 24-bit BGR (3 bytes/pixel, BMP native order)
-//   - BMP rows are stored bottom-to-top, padded to 4-byte boundaries
-//   - Output size for 320x240: 54 + (960 * 240) = 230,454 bytes
 
-void DisplayCaptureHandler::generate_bmp_() {
-  // Free the previous screenshot buffer. This is deferred from
-  // handle_screenshot_() because the async web server may still be reading
-  // from the buffer when that function returns. By the time the next request
-  // reaches generate_bmp_(), the previous response is guaranteed to have
-  // been fully sent (the semaphore ensures only one request at a time).
-  if (this->bmp_data_ != nullptr) {
-    heap_caps_free(this->bmp_data_);
-    this->bmp_data_ = nullptr;
-    this->bmp_size_ = 0;
+void DisplayCaptureHandler::prepare_stream_capture_() {
+  this->stream_ready_ = false;
+  this->stream_failed_ = false;
+  this->stream_fb_ = nullptr;
+  this->stream_chunk_filled_ = 0;
+  this->stream_was_sleeping_ = false;
+  this->stream_page_switched_ = false;
+
+#ifdef DISPLAY_CAPTURE_USE_GLOBALS
+  if (this->sleep_global_ != nullptr && this->sleep_global_->value()) {
+    this->stream_was_sleeping_ = true;
+    this->sleep_global_->value() = false;
   }
+#endif
 
-  // get_width()/get_height() return dimensions after rotation (what you see on screen).
-  // get_native_width()/get_native_height() return the panel's physical dimensions
-  // (before rotation) -- these are needed for buffer indexing.
-  int screen_w = this->display_->get_width();
-  int screen_h = this->display_->get_height();
-  int w_int = this->display_->get_native_width();
-  int h_int = this->display_->get_native_height();
-  auto rotation = this->display_->get_rotation();
-
-  auto alloc_for_bmp = [&](uint32_t size, bool &from_psram) -> bool {
-    this->bmp_data_ = nullptr;
-    from_psram = false;
-    switch (this->memory_mode_) {
-      case MEMORY_PSRAM:
-        this->bmp_data_ = (uint8_t *) heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
-        from_psram = this->bmp_data_ != nullptr;
-        break;
-      case MEMORY_INTERNAL:
-        this->bmp_data_ = (uint8_t *) heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        break;
-      case MEMORY_AUTO:
-      default:
-        this->bmp_data_ = (uint8_t *) heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
-        if (this->bmp_data_ != nullptr) {
-          from_psram = true;
-        } else {
-          this->bmp_data_ = (uint8_t *) heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (this->requested_page_ >= 0) {
+    switch (this->page_mode_) {
+      case NATIVE_PAGES: {
+        int idx = this->requested_page_;
+        if (idx >= 0 && idx < (int) this->pages_.size()) {
+          this->saved_native_page_ = this->display_->get_active_page();
+          this->display_->show_page(this->pages_[idx]);
+          this->stream_page_switched_ = true;
         }
         break;
-    }
-    return this->bmp_data_ != nullptr;
-  };
-
-  // Prefer 24-bit BMP; if that fails, try 16-bit RGB565 BMP; then 8-bit indexed BMP.
-  int bits_per_pixel = 24;
-  int bytes_per_pixel = 3;
-  int row_stride = ((screen_w * bytes_per_pixel + 3) / 4) * 4;
-  uint32_t pixel_data_offset = 54;  // file header + BITMAPINFOHEADER
-  uint32_t pixel_data_size = row_stride * screen_h;
-  uint32_t file_size = pixel_data_offset + pixel_data_size;
-  bool allocated_from_psram = false;
-  uint32_t attempted_24bit_size = file_size;
-  uint32_t attempted_16bit_size = 0;
-
-  if (!alloc_for_bmp(file_size, allocated_from_psram)) {
-    bits_per_pixel = 16;
-    bytes_per_pixel = 2;
-    row_stride = ((screen_w * bytes_per_pixel + 3) / 4) * 4;
-    pixel_data_offset = 66;  // + 12 bytes RGB masks for BI_BITFIELDS
-    pixel_data_size = row_stride * screen_h;
-    file_size = pixel_data_offset + pixel_data_size;
-
-    attempted_16bit_size = file_size;
-    if (!alloc_for_bmp(file_size, allocated_from_psram)) {
-      bits_per_pixel = 8;
-      bytes_per_pixel = 1;
-      row_stride = ((screen_w * bytes_per_pixel + 3) / 4) * 4;
-      pixel_data_offset = 54 + (256 * 4);  // + 256-color palette
-      pixel_data_size = row_stride * screen_h;
-      file_size = pixel_data_offset + pixel_data_size;
-
-      if (!alloc_for_bmp(file_size, allocated_from_psram)) {
-        ESP_LOGE(TAG,
-                 "Failed to allocate BMP (%u bytes for 24-bit, %u bytes for 16-bit, %u bytes for 8-bit, memory mode: %s)",
-                 attempted_24bit_size, attempted_16bit_size, file_size,
-                 this->memory_mode_ == MEMORY_PSRAM ? "psram" :
-                 this->memory_mode_ == MEMORY_INTERNAL ? "internal" : "auto");
-        this->bmp_size_ = 0;
-        return;
       }
-      ESP_LOGW(TAG, "24-bit and 16-bit BMP allocation failed; falling back to 8-bit BMP (%u bytes)", file_size);
-    } else {
-      ESP_LOGW(TAG, "24-bit BMP allocation failed; falling back to 16-bit RGB565 BMP (%u bytes)", file_size);
+#ifdef DISPLAY_CAPTURE_USE_GLOBALS
+      case GLOBAL_PAGES: {
+        this->saved_global_page_ = this->page_global_->value();
+        if (this->saved_global_page_ != this->requested_page_) {
+          this->page_global_->value() = this->requested_page_;
+          this->stream_page_switched_ = true;
+        }
+        break;
+      }
+#endif
+      default:
+        break;
     }
   }
 
-  ESP_LOGD(TAG, "Allocated %u bytes for %d-bit BMP from %s RAM",
-           file_size, bits_per_pixel, allocated_from_psram ? "PSRAM" : "internal");
-  this->bmp_size_ = file_size;
+  // Render requested state before streaming from framebuffer.
+  this->display_->update();
 
-  memset(this->bmp_data_, 0, pixel_data_offset);
+  this->stream_screen_w_ = this->display_->get_width();
+  this->stream_screen_h_ = this->display_->get_height();
+  this->stream_native_w_ = this->display_->get_native_width();
+  this->stream_native_h_ = this->display_->get_native_height();
+  this->stream_rotation_ = (int) this->display_->get_rotation();
+  this->stream_row_stride_ = ((this->stream_screen_w_ * 3 + 3) / 4) * 4;
+  this->stream_file_size_ = 54 + (size_t) this->stream_row_stride_ * this->stream_screen_h_;
 
-  // --- BMP file header (14 bytes) ---
-  this->bmp_data_[0] = 'B';
-  this->bmp_data_[1] = 'M';
-  write_le32_(this->bmp_data_ + 2, file_size);
-  write_le32_(this->bmp_data_ + 10, pixel_data_offset);  // offset to pixel data
+  memset(this->stream_header_, 0, sizeof(this->stream_header_));
+  this->stream_header_[0] = 'B';
+  this->stream_header_[1] = 'M';
+  write_le32_(this->stream_header_ + 2, this->stream_file_size_);
+  write_le32_(this->stream_header_ + 10, 54);
+  write_le32_(this->stream_header_ + 14, 40);
+  write_le32_(this->stream_header_ + 18, this->stream_screen_w_);
+  write_le32_(this->stream_header_ + 22, this->stream_screen_h_);
+  write_le16_(this->stream_header_ + 26, 1);
+  write_le16_(this->stream_header_ + 28, 24);
+  write_le32_(this->stream_header_ + 34, (uint32_t) this->stream_row_stride_ * this->stream_screen_h_);
 
-  // --- DIB header (BITMAPINFOHEADER, 40 bytes) ---
-  write_le32_(this->bmp_data_ + 14, 40);         // header size
-  write_le32_(this->bmp_data_ + 18, screen_w);   // width
-  write_le32_(this->bmp_data_ + 22, screen_h);   // height (positive = bottom-up)
-  write_le16_(this->bmp_data_ + 26, 1);          // color planes
-  write_le16_(this->bmp_data_ + 28, bits_per_pixel);
-  write_le32_(this->bmp_data_ + 30, bits_per_pixel == 16 ? 3 : 0);  // BI_BITFIELDS for RGB565, BI_RGB otherwise
-  write_le32_(this->bmp_data_ + 34, pixel_data_size);
-  write_le32_(this->bmp_data_ + 46, bits_per_pixel == 8 ? 256 : 0);  // color table size
-  write_le32_(this->bmp_data_ + 50, bits_per_pixel == 8 ? 256 : 0);  // important colors
-
-  // Channel masks for 16-bit BI_BITFIELDS BMP (RGB565).
-  if (bits_per_pixel == 16) {
-    write_le32_(this->bmp_data_ + 54, 0xF800);
-    write_le32_(this->bmp_data_ + 58, 0x07E0);
-    write_le32_(this->bmp_data_ + 62, 0x001F);
-  } else if (bits_per_pixel == 8) {
-    // 8-bit BMP palette using RGB332 mapping.
-    for (int i = 0; i < 256; i++) {
-      uint8_t r3 = (i >> 5) & 0x07;
-      uint8_t g3 = (i >> 2) & 0x07;
-      uint8_t b2 = i & 0x03;
-      uint8_t r = (r3 * 255) / 7;
-      uint8_t g = (g3 * 255) / 7;
-      uint8_t b = (b2 * 255) / 3;
-      int p = 54 + i * 4;
-      this->bmp_data_[p + 0] = b;
-      this->bmp_data_[p + 1] = g;
-      this->bmp_data_[p + 2] = r;
-      this->bmp_data_[p + 3] = 0;
-    }
-  }
-
-  // --- Pixel data ---
-  // Get the framebuffer pointer using the configured backend.
-  uint8_t *buf = nullptr;
   if (this->backend_ == BACKEND_RPI_DPI_RGB) {
 #ifdef USE_RPI_DPI_RGB
     auto *rgb_display = static_cast<rpi_dpi_rgb::RpiDpiRgb *>(this->display_);
     if (rgb_display->handle_ == nullptr) {
       ESP_LOGE(TAG, "rpi_dpi_rgb handle is null");
-      heap_caps_free(this->bmp_data_);
-      this->bmp_data_ = nullptr;
-      this->bmp_size_ = 0;
+      this->stream_failed_ = true;
       return;
     }
     void *fb = nullptr;
     esp_err_t err = esp_lcd_rgb_panel_get_frame_buffer(rgb_display->handle_, 1, &fb);
     if (err != ESP_OK || fb == nullptr) {
       ESP_LOGE(TAG, "Failed to get rpi_dpi_rgb frame buffer (%d)", err);
-      heap_caps_free(this->bmp_data_);
-      this->bmp_data_ = nullptr;
-      this->bmp_size_ = 0;
+      this->stream_failed_ = true;
       return;
     }
-    buf = static_cast<uint8_t *>(fb);
+    this->stream_fb_ = static_cast<uint8_t *>(fb);
 #else
     ESP_LOGE(TAG, "rpi_dpi_rgb backend requested but USE_RPI_DPI_RGB is not enabled in this build");
-    heap_caps_free(this->bmp_data_);
-    this->bmp_data_ = nullptr;
-    this->bmp_size_ = 0;
+    this->stream_failed_ = true;
     return;
 #endif
   } else {
-    // Standard DisplayBuffer path (ILI9XXX, ST7789V, etc.)
-    // dynamic_cast is unavailable with -fno-rtti, so we use static_cast.
     auto *display_buffer = static_cast<display::DisplayBuffer *>(this->display_);
-    buf = display_buffer->buffer_;
+    this->stream_fb_ = display_buffer->buffer_;
   }
 
-  for (int sy = 0; sy < screen_h; sy++) {
-    // BMP stores rows bottom-to-top
-    int bmp_row = screen_h - 1 - sy;
-    uint8_t *row_ptr = this->bmp_data_ + pixel_data_offset + bmp_row * row_stride;
+  if (this->stream_fb_ == nullptr) {
+    ESP_LOGE(TAG, "Frame buffer pointer is null");
+    this->stream_failed_ = true;
+    return;
+  }
 
-    for (int sx = 0; sx < screen_w; sx++) {
-      // Map screen coordinates (sx, sy) to buffer coordinates (bx, by).
-      //
-      // ESPHome's draw_pixel_at() applies a forward rotation transform when
-      // writing pixels to the buffer. We need the INVERSE transform to read
-      // them back in screen order:
-      //
-      //   Rotation | Forward (screen->buffer)       | Inverse (buffer->screen)
-      //   ---------|--------------------------------|-------------------------
-      //   0°       | bx=sx, by=sy                   | bx=sx, by=sy
-      //   90°      | bx=w-1-y, by=x                 | bx=w-1-sy, by=sx
-      //   180°     | bx=w-1-x, by=h-1-y             | bx=w-1-sx, by=h-1-sy
-      //   270°     | bx=y, by=h-1-x                 | bx=sy, by=h-1-sx
-      //
-      // w and h here are native (pre-rotation) panel dimensions.
-      int bx, by;
-      switch (rotation) {
-        case display::DISPLAY_ROTATION_0_DEGREES:
-          bx = sx;
-          by = sy;
-          break;
-        case display::DISPLAY_ROTATION_90_DEGREES:
-          bx = w_int - 1 - sy;
-          by = sx;
-          break;
-        case display::DISPLAY_ROTATION_180_DEGREES:
-          bx = w_int - 1 - sx;
-          by = h_int - 1 - sy;
-          break;
-        case display::DISPLAY_ROTATION_270_DEGREES:
-          bx = sy;
-          by = h_int - 1 - sx;
-          break;
-        default:
-          bx = sx;
-          by = sy;
-          break;
-      }
+  this->stream_ready_ = true;
+}
 
-      uint32_t pos = (by * w_int + bx) * 2;
-      uint8_t high = buf[pos];
-      uint8_t low = buf[pos + 1];
-      if (bits_per_pixel == 16) {
-        // Source buffer uses high-byte then low-byte RGB565; BMP stores
-        // 16-bit pixels little-endian.
-        row_ptr[sx * 2 + 0] = low;
-        row_ptr[sx * 2 + 1] = high;
-      } else if (bits_per_pixel == 8) {
-        // Quantize RGB565 to RGB332 palette index.
-        uint8_t r3 = (high >> 3) >> 2;  // r5 -> r3
-        uint8_t g6 = ((high & 0x07) << 3) | (low >> 5);
-        uint8_t g3 = g6 >> 3;           // g6 -> g3
-        uint8_t b2 = (low & 0x1F) >> 3; // b5 -> b2
-        row_ptr[sx] = (r3 << 5) | (g3 << 2) | b2;
-      } else {
-        // Decode RGB565 pixel (2 bytes per pixel in BITS_16 mode):
-        //
-        //   byte[0] = RRRRRGGG  (high byte: 5 bits red, upper 3 bits green)
-        //   byte[1] = GGGBBBBB  (low byte: lower 3 bits green, 5 bits blue)
-        //
-        // Expand to 8-bit per channel with proper scaling (not just shifting).
+void DisplayCaptureHandler::fill_stream_chunk_() {
+  if (!this->stream_ready_ || this->stream_failed_ || this->stream_fb_ == nullptr) {
+    this->stream_chunk_filled_ = 0;
+    return;
+  }
+
+  size_t index = this->stream_chunk_index_;
+  size_t len = this->stream_chunk_len_;
+  if (index >= this->stream_file_size_) {
+    this->stream_chunk_filled_ = 0;
+    return;
+  }
+  if (index + len > this->stream_file_size_) {
+    len = this->stream_file_size_ - index;
+  }
+
+  for (size_t i = 0; i < len; i++) {
+    size_t file_pos = index + i;
+    uint8_t out = 0;
+
+    if (file_pos < 54) {
+      out = this->stream_header_[file_pos];
+    } else {
+      size_t pixel_pos = file_pos - 54;
+      int row = pixel_pos / this->stream_row_stride_;
+      int row_off = pixel_pos % this->stream_row_stride_;
+
+      if (row_off < this->stream_screen_w_ * 3) {
+        int sx = row_off / 3;
+        int ch = row_off % 3;  // 0=B,1=G,2=R
+        int sy = this->stream_screen_h_ - 1 - row;
+
+        int bx = sx;
+        int by = sy;
+        switch (this->stream_rotation_) {
+          case display::DISPLAY_ROTATION_90_DEGREES:
+            bx = this->stream_native_w_ - 1 - sy;
+            by = sx;
+            break;
+          case display::DISPLAY_ROTATION_180_DEGREES:
+            bx = this->stream_native_w_ - 1 - sx;
+            by = this->stream_native_h_ - 1 - sy;
+            break;
+          case display::DISPLAY_ROTATION_270_DEGREES:
+            bx = sy;
+            by = this->stream_native_h_ - 1 - sx;
+            break;
+          default:
+            break;
+        }
+
+        uint32_t pos = (by * this->stream_native_w_ + bx) * 2;
+        uint8_t high = this->stream_fb_[pos];
+        uint8_t low = this->stream_fb_[pos + 1];
         uint8_t r5 = high >> 3;
         uint8_t g6 = ((high & 0x07) << 3) | (low >> 5);
         uint8_t b5 = low & 0x1F;
         uint8_t r = (r5 * 255) / 31;
         uint8_t g = (g6 * 255) / 63;
         uint8_t b = (b5 * 255) / 31;
-
-        // BMP pixel order is BGR (not RGB)
-        row_ptr[sx * 3 + 0] = b;
-        row_ptr[sx * 3 + 1] = g;
-        row_ptr[sx * 3 + 2] = r;
+        out = ch == 0 ? b : (ch == 1 ? g : r);
       }
+    }
+
+    this->stream_chunk_buf_[i] = out;
+  }
+
+  this->stream_chunk_filled_ = len;
+}
+
+void DisplayCaptureHandler::finish_stream_capture_() {
+  if (this->stream_page_switched_) {
+    switch (this->page_mode_) {
+      case NATIVE_PAGES:
+        if (this->saved_native_page_ != nullptr) {
+          this->display_->show_page(const_cast<display::DisplayPage *>(this->saved_native_page_));
+        }
+        break;
+#ifdef DISPLAY_CAPTURE_USE_GLOBALS
+      case GLOBAL_PAGES:
+        this->page_global_->value() = this->saved_global_page_;
+        break;
+#endif
+      default:
+        break;
     }
   }
 
-  ESP_LOGI(TAG, "Generated %dx%d %d-bit BMP (%u bytes)", screen_w, screen_h, bits_per_pixel, file_size);
+#ifdef DISPLAY_CAPTURE_USE_GLOBALS
+  if (this->stream_was_sleeping_) {
+    this->sleep_global_->value() = true;
+  }
+#endif
+
+  if (this->stream_page_switched_ || this->stream_was_sleeping_) {
+    this->display_->update();
+  }
+
+  this->stream_ready_ = false;
+  this->stream_in_progress_ = false;
+  this->stream_fb_ = nullptr;
 }
 
 }  // namespace display_capture

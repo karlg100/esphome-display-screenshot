@@ -52,18 +52,10 @@ enum CaptureBackend {
   BACKEND_RPI_DPI_RGB,     ///< rpi_dpi_rgb (ESP32-S3 RGB LCD panels)
 };
 
-/// How BMP memory is allocated.
-enum MemoryMode {
-  MEMORY_AUTO,      ///< Prefer PSRAM, fall back to internal RAM
-  MEMORY_PSRAM,     ///< PSRAM only
-  MEMORY_INTERNAL,  ///< Internal RAM only
-};
-
 /// HTTP handler that captures the display framebuffer as a BMP image.
 ///
 /// Registers two endpoints on the device's existing web server:
-///   GET /screenshot[?page=N]  -- returns a BMP of the display (24-bit preferred,
-///                                then 16-bit RGB565, then 8-bit indexed fallback)
+///   GET /screenshot[?page=N]  -- returns a streamed 24-bit BMP of the display
 ///   GET /screenshot/info      -- returns JSON metadata (page count, dimensions, mode)
 ///
 /// Thread safety: the /screenshot endpoint uses a binary semaphore to hand off
@@ -102,17 +94,8 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
     this->backend_ = BACKEND_DISPLAY_BUFFER;
   }
 
-  void set_memory_mode(const std::string &memory_mode) {
-    if (memory_mode == "psram") {
-      this->memory_mode_ = MEMORY_PSRAM;
-      return;
-    }
-    if (memory_mode == "internal") {
-      this->memory_mode_ = MEMORY_INTERNAL;
-      return;
-    }
-    this->memory_mode_ = MEMORY_AUTO;
-  }
+  // Backward compatibility: memory mode is ignored in streaming implementation.
+  void set_memory_mode(const std::string &memory_mode) { (void) memory_mode; }
 
   // --- AsyncWebHandler interface ---
 
@@ -145,8 +128,12 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
   void handle_screenshot_(AsyncWebServerRequest *req);
   /// Handles GET /screenshot/info -- returns JSON, no semaphore needed.
   void handle_info_(AsyncWebServerRequest *req);
-  /// Reads the display buffer and generates a BMP in configured memory.
-  void generate_bmp_();
+  /// Runs on main loop: prepares page/sleep state and stream metadata.
+  void prepare_stream_capture_();
+  /// Runs on main loop: fills one requested chunk of BMP data.
+  void fill_stream_chunk_();
+  /// Runs on main loop: restores original page/sleep state after streaming.
+  void finish_stream_capture_();
 
   /// Write a 32-bit value in little-endian byte order (for BMP headers).
   static void write_le32_(uint8_t *p, uint32_t v) {
@@ -171,7 +158,6 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
 
   PageMode page_mode_{SINGLE};
   CaptureBackend backend_{BACKEND_DISPLAY_BUFFER};  ///< Framebuffer extraction backend
-  MemoryMode memory_mode_{MEMORY_AUTO};             ///< BMP allocation strategy
   std::vector<display::DisplayPage *> pages_;       ///< Native page pointers (NATIVE_PAGES mode)
   std::vector<std::string> page_names_;             ///< Human-readable names for /info endpoint
 
@@ -183,8 +169,34 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
   SemaphoreHandle_t semaphore_{nullptr};   ///< Coordinates HTTP task <-> main loop handoff
   volatile bool request_pending_{false};   ///< Flag: HTTP task has a pending screenshot request
   volatile int requested_page_{-1};        ///< Which page to capture (-1 = current)
-  uint8_t *bmp_data_{nullptr};             ///< Buffer holding the generated BMP
-  size_t bmp_size_{0};                     ///< Size of the BMP data in bytes
+
+  // Stream state shared between web task and main loop.
+  static const size_t STREAM_CHUNK_SIZE = 1024;
+  volatile bool stream_ready_{false};
+  volatile bool stream_in_progress_{false};
+  volatile bool stream_failed_{false};
+  volatile bool stream_chunk_requested_{false};
+  volatile bool stream_restore_pending_{false};
+  volatile size_t stream_chunk_index_{0};
+  volatile size_t stream_chunk_len_{0};
+  size_t stream_chunk_filled_{0};
+  uint8_t stream_chunk_buf_[STREAM_CHUNK_SIZE];
+  SemaphoreHandle_t stream_chunk_done_{nullptr};
+
+  // Snapshot metadata captured on the main loop before streaming begins.
+  uint8_t *stream_fb_{nullptr};
+  int stream_screen_w_{0};
+  int stream_screen_h_{0};
+  int stream_native_w_{0};
+  int stream_native_h_{0};
+  int stream_rotation_{0};
+  int stream_row_stride_{0};
+  size_t stream_file_size_{0};
+  uint8_t stream_header_[54];
+
+  // State to restore after streaming finishes.
+  bool stream_was_sleeping_{false};
+  bool stream_page_switched_{false};
 };
 
 }  // namespace display_capture

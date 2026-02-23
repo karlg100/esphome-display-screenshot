@@ -78,7 +78,7 @@ Two HTTP endpoints:
 
 | Endpoint | Returns |
 |----------|---------|
-| `GET /screenshot[?page=N]` | BMP image of the display (24-bit preferred, then 16-bit, then 8-bit fallback on low memory) |
+| `GET /screenshot[?page=N]` | 24-bit BMP image of the display (streamed, no full-frame buffer allocation) |
 | `GET /screenshot/info` | JSON with page count, dimensions, mode, and page names |
 
 Open any of these in your browser, or use curl to save to a file:
@@ -100,7 +100,7 @@ curl http://<YOUR-DEVICE-IP>/screenshot/info
 
 ## Requirements
 
-- **ESP32** -- PSRAM is recommended, but optional. The component needs enough free RAM for a full BMP buffer (~225 KB at 320x240). By default it prefers PSRAM and falls back to internal RAM.
+- **ESP32** -- PSRAM is optional. `/screenshot` now streams output in chunks instead of allocating a full-frame BMP buffer.
 - **Display using RGB565** -- any `DisplayBuffer` subclass in `BITS_16` colour mode (ILI9XXX, ST7789V, ILI9341, ILI9488, etc.), or `rpi_dpi_rgb` displays when `backend: rpi_dpi_rgb` is set
 - **`web_server` component enabled** -- the screenshot endpoint hooks into ESPHome's built-in web server
 
@@ -290,7 +290,7 @@ Once running, your device exposes two new HTTP endpoints:
 
 ### `GET /screenshot`
 
-Returns a BMP image of the current display. The component prefers 24-bit output and automatically falls back to 16-bit RGB565, then 8-bit indexed color when memory is tight.
+Returns a 24-bit BMP image of the current display. The response is streamed in chunks, so it does not allocate a full-frame BMP buffer in RAM.
 
 ```
 http://<YOUR-DEVICE-IP>/screenshot
@@ -346,7 +346,8 @@ curl http://<YOUR-DEVICE-IP>/screenshot/info
 | Code | Meaning |
 |------|---------|
 | 200 | Success -- BMP or JSON returned |
-| 500 | BMP allocation failed (device out of memory for selected memory mode) |
+| 500 | Failed to prepare screenshot stream (framebuffer/backend issue) |
+| 429 | Screenshot already in progress |
 | 504 | Main loop didn't respond in 5 seconds (device too busy) |
 
 ---
@@ -361,7 +362,7 @@ curl http://<YOUR-DEVICE-IP>/screenshot/info
 | `sleep_global` | ID | No | `globals` bool -- wakes display before capture |
 | `page_names` | list of strings | No | Human-readable names for the `/screenshot/info` endpoint |
 | `backend` | string | No | Framebuffer backend: `display_buffer` (default) or `rpi_dpi_rgb` for ESP32-S3 RGB LCD panels |
-| `memory` | string | No | BMP buffer allocation strategy: `auto` (default, PSRAM then internal; if 24-bit alloc fails, auto-falls back to 16-bit, then 8-bit BMP), `psram`, or `internal` |
+| `memory` | string | No | Deprecated compatibility option. Ignored in streaming mode. |
 
 ---
 
@@ -388,14 +389,15 @@ The main ESPHome loop didn't respond within 5 seconds. This usually means:
 
 ### 500 error on `/screenshot`
 
-BMP allocation failed for the selected memory mode. Try one of these:
+Screenshot stream preparation failed. Check:
 
-- Set `memory: auto` (default) so it can fall back to internal RAM when PSRAM isn't available.
-- Set `memory: internal` explicitly on boards without PSRAM.
-- Reduce display resolution to lower BMP size.
-- Free RAM elsewhere (disable unneeded components/logging).
+- `display_id` points to a valid display
+- `backend` matches your display type (`display_buffer` or `rpi_dpi_rgb`)
+- For `rpi_dpi_rgb`, the RGB panel handle is valid and initialized
 
-If you're expecting PSRAM, verify that your board actually has it and it's enabled. For ESP32-S3, you may need:
+If you're using `rpi_dpi_rgb`, ensure your panel config is valid and initialized before capture.
+
+If you're expecting PSRAM for other components, verify your board config. For ESP32-S3, you may need:
 
 ```yaml
 esp32:
