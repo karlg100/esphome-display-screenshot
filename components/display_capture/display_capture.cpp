@@ -470,7 +470,7 @@ void DisplayCaptureHandler::generate_bmp_() {
           // are packed LSB-first within each byte.
           uint32_t pos = by * ((w_int + 7) / 8) + (bx / 8);
           uint8_t mask = static_cast<uint8_t>(1U << (bx & 7));
-          uint8_t v = (buf[pos] & mask) ? 255 : 0;
+          uint8_t v = (buf[pos] & mask) ? 0 : 255;
           r = v;
           g = v;
           b = v;
