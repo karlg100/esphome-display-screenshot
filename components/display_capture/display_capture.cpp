@@ -466,10 +466,10 @@ void DisplayCaptureHandler::generate_bmp_() {
           g = v;
           b = v;
         } else {
-          // Inkplate 1-bit mode stores 8 pixels per byte. Bit=1 is white,
-          // bit=0 is black in the framebuffer.
-          uint32_t pos = by * (w_int / 8) + (bx / 8);
-          uint8_t mask = static_cast<uint8_t>(0x80 >> (bx & 7));
+          // Inkplate 1-bit mode stores 8 pixels per byte. Inkplate buffers
+          // are packed LSB-first within each byte.
+          uint32_t pos = by * ((w_int + 7) / 8) + (bx / 8);
+          uint8_t mask = static_cast<uint8_t>(1U << (bx & 7));
           uint8_t v = (buf[pos] & mask) ? 255 : 0;
           r = v;
           g = v;
