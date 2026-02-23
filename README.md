@@ -78,7 +78,7 @@ Two HTTP endpoints:
 
 | Endpoint | Returns |
 |----------|---------|
-| `GET /screenshot[?page=N]` | 24-bit BMP image of the display |
+| `GET /screenshot[?page=N]` | BMP image of the display (24-bit preferred, 16-bit fallback on low memory) |
 | `GET /screenshot/info` | JSON with page count, dimensions, mode, and page names |
 
 Open any of these in your browser, or use curl to save to a file:
@@ -290,7 +290,7 @@ Once running, your device exposes two new HTTP endpoints:
 
 ### `GET /screenshot`
 
-Returns a 24-bit BMP image of the current display. Open in a browser or save from the command line:
+Returns a BMP image of the current display. The component prefers 24-bit output and automatically falls back to 16-bit RGB565 when memory is tight.
 
 ```
 http://<YOUR-DEVICE-IP>/screenshot
@@ -361,7 +361,7 @@ curl http://<YOUR-DEVICE-IP>/screenshot/info
 | `sleep_global` | ID | No | `globals` bool -- wakes display before capture |
 | `page_names` | list of strings | No | Human-readable names for the `/screenshot/info` endpoint |
 | `backend` | string | No | Framebuffer backend: `display_buffer` (default) or `rpi_dpi_rgb` for ESP32-S3 RGB LCD panels |
-| `memory` | string | No | BMP buffer allocation strategy: `auto` (default, PSRAM then internal), `psram`, or `internal` |
+| `memory` | string | No | BMP buffer allocation strategy: `auto` (default, PSRAM then internal; if 24-bit alloc fails, auto-falls back to 16-bit BMP), `psram`, or `internal` |
 
 ---
 

@@ -295,8 +295,9 @@ void DisplayCaptureHandler::handle_info_(AsyncWebServerRequest *req) {
 // BMP generation -- called from loop() on the main task
 // ============================================================================
 //
-// Reads the display's internal RGB565 framebuffer and generates a standard
-// 24-bit uncompressed BMP (BITMAPINFOHEADER format).
+// Reads the display's internal RGB565 framebuffer and generates a BMP.
+// Prefers 24-bit output and falls back to 16-bit RGB565 (BITFIELDS)
+// when memory is too tight for the 24-bit buffer.
 //
 // Key details:
 //   - Uses static_cast to access DisplayBuffer::buffer_ (dynamic_cast is
@@ -328,55 +329,86 @@ void DisplayCaptureHandler::generate_bmp_() {
   int h_int = this->display_->get_native_height();
   auto rotation = this->display_->get_rotation();
 
-  // BMP row stride must be a multiple of 4 bytes
-  int row_stride = ((screen_w * 3 + 3) / 4) * 4;
-  uint32_t pixel_data_size = row_stride * screen_h;
-  uint32_t file_size = 54 + pixel_data_size;  // 14 (file header) + 40 (DIB header) + pixels
+  auto alloc_for_bmp = [&](uint32_t size, bool &from_psram) -> bool {
+    this->bmp_data_ = nullptr;
+    from_psram = false;
+    switch (this->memory_mode_) {
+      case MEMORY_PSRAM:
+        this->bmp_data_ = (uint8_t *) heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+        from_psram = this->bmp_data_ != nullptr;
+        break;
+      case MEMORY_INTERNAL:
+        this->bmp_data_ = (uint8_t *) heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        break;
+      case MEMORY_AUTO:
+      default:
+        this->bmp_data_ = (uint8_t *) heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+        if (this->bmp_data_ != nullptr) {
+          from_psram = true;
+        } else {
+          this->bmp_data_ = (uint8_t *) heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        break;
+    }
+    return this->bmp_data_ != nullptr;
+  };
 
+  // Prefer 24-bit BMP; if that fails, try 16-bit RGB565 BMP.
+  int bits_per_pixel = 24;
+  int bytes_per_pixel = 3;
+  int row_stride = ((screen_w * bytes_per_pixel + 3) / 4) * 4;
+  uint32_t pixel_data_offset = 54;  // file header + BITMAPINFOHEADER
+  uint32_t pixel_data_size = row_stride * screen_h;
+  uint32_t file_size = pixel_data_offset + pixel_data_size;
   bool allocated_from_psram = false;
-  switch (this->memory_mode_) {
-    case MEMORY_PSRAM:
-      this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-      allocated_from_psram = this->bmp_data_ != nullptr;
-      break;
-    case MEMORY_INTERNAL:
-      this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      break;
-    case MEMORY_AUTO:
-    default:
-      this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-      if (this->bmp_data_ != nullptr) {
-        allocated_from_psram = true;
-      } else {
-        this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      }
-      break;
+  uint32_t attempted_24bit_size = file_size;
+
+  if (!alloc_for_bmp(file_size, allocated_from_psram)) {
+    bits_per_pixel = 16;
+    bytes_per_pixel = 2;
+    row_stride = ((screen_w * bytes_per_pixel + 3) / 4) * 4;
+    pixel_data_offset = 66;  // + 12 bytes RGB masks for BI_BITFIELDS
+    pixel_data_size = row_stride * screen_h;
+    file_size = pixel_data_offset + pixel_data_size;
+
+    if (!alloc_for_bmp(file_size, allocated_from_psram)) {
+      ESP_LOGE(TAG, "Failed to allocate BMP (%u bytes for 24-bit, %u bytes for 16-bit, memory mode: %s)",
+               attempted_24bit_size, file_size,
+               this->memory_mode_ == MEMORY_PSRAM ? "psram" :
+               this->memory_mode_ == MEMORY_INTERNAL ? "internal" : "auto");
+      this->bmp_size_ = 0;
+      return;
+    }
+    ESP_LOGW(TAG, "24-bit BMP allocation failed; falling back to 16-bit RGB565 BMP (%u bytes)", file_size);
   }
-  if (this->bmp_data_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to allocate %u bytes for BMP (memory mode: %s)", file_size,
-             this->memory_mode_ == MEMORY_PSRAM ? "psram" :
-             this->memory_mode_ == MEMORY_INTERNAL ? "internal" : "auto");
-    this->bmp_size_ = 0;
-    return;
-  }
-  ESP_LOGD(TAG, "Allocated %u bytes for BMP from %s RAM", file_size, allocated_from_psram ? "PSRAM" : "internal");
+
+  ESP_LOGD(TAG, "Allocated %u bytes for %d-bit BMP from %s RAM",
+           file_size, bits_per_pixel, allocated_from_psram ? "PSRAM" : "internal");
   this->bmp_size_ = file_size;
 
-  memset(this->bmp_data_, 0, 54);
+  memset(this->bmp_data_, 0, pixel_data_offset);
 
   // --- BMP file header (14 bytes) ---
   this->bmp_data_[0] = 'B';
   this->bmp_data_[1] = 'M';
   write_le32_(this->bmp_data_ + 2, file_size);
-  write_le32_(this->bmp_data_ + 10, 54);  // offset to pixel data
+  write_le32_(this->bmp_data_ + 10, pixel_data_offset);  // offset to pixel data
 
   // --- DIB header (BITMAPINFOHEADER, 40 bytes) ---
   write_le32_(this->bmp_data_ + 14, 40);         // header size
   write_le32_(this->bmp_data_ + 18, screen_w);   // width
   write_le32_(this->bmp_data_ + 22, screen_h);   // height (positive = bottom-up)
   write_le16_(this->bmp_data_ + 26, 1);          // color planes
-  write_le16_(this->bmp_data_ + 28, 24);         // bits per pixel
+  write_le16_(this->bmp_data_ + 28, bits_per_pixel);
+  write_le32_(this->bmp_data_ + 30, bits_per_pixel == 16 ? 3 : 0);  // BI_BITFIELDS for RGB565
   write_le32_(this->bmp_data_ + 34, pixel_data_size);
+
+  // Channel masks for 16-bit BI_BITFIELDS BMP (RGB565).
+  if (bits_per_pixel == 16) {
+    write_le32_(this->bmp_data_ + 54, 0xF800);
+    write_le32_(this->bmp_data_ + 58, 0x07E0);
+    write_le32_(this->bmp_data_ + 62, 0x001F);
+  }
 
   // --- Pixel data ---
   // Get the framebuffer pointer using the configured backend.
@@ -418,7 +450,7 @@ void DisplayCaptureHandler::generate_bmp_() {
   for (int sy = 0; sy < screen_h; sy++) {
     // BMP stores rows bottom-to-top
     int bmp_row = screen_h - 1 - sy;
-    uint8_t *row_ptr = this->bmp_data_ + 54 + bmp_row * row_stride;
+    uint8_t *row_ptr = this->bmp_data_ + pixel_data_offset + bmp_row * row_stride;
 
     for (int sx = 0; sx < screen_w; sx++) {
       // Map screen coordinates (sx, sy) to buffer coordinates (bx, by).
@@ -459,31 +491,37 @@ void DisplayCaptureHandler::generate_bmp_() {
           break;
       }
 
-      // Decode RGB565 pixel (2 bytes per pixel in BITS_16 mode):
-      //
-      //   byte[0] = RRRRRGGG  (high byte: 5 bits red, upper 3 bits green)
-      //   byte[1] = GGGBBBBB  (low byte: lower 3 bits green, 5 bits blue)
-      //
-      // Expand to 8-bit per channel with proper scaling (not just shifting).
       uint32_t pos = (by * w_int + bx) * 2;
       uint8_t high = buf[pos];
       uint8_t low = buf[pos + 1];
+      if (bits_per_pixel == 16) {
+        // Source buffer uses high-byte then low-byte RGB565; BMP stores
+        // 16-bit pixels little-endian.
+        row_ptr[sx * 2 + 0] = low;
+        row_ptr[sx * 2 + 1] = high;
+      } else {
+        // Decode RGB565 pixel (2 bytes per pixel in BITS_16 mode):
+        //
+        //   byte[0] = RRRRRGGG  (high byte: 5 bits red, upper 3 bits green)
+        //   byte[1] = GGGBBBBB  (low byte: lower 3 bits green, 5 bits blue)
+        //
+        // Expand to 8-bit per channel with proper scaling (not just shifting).
+        uint8_t r5 = high >> 3;
+        uint8_t g6 = ((high & 0x07) << 3) | (low >> 5);
+        uint8_t b5 = low & 0x1F;
+        uint8_t r = (r5 * 255) / 31;
+        uint8_t g = (g6 * 255) / 63;
+        uint8_t b = (b5 * 255) / 31;
 
-      uint8_t r5 = high >> 3;
-      uint8_t g6 = ((high & 0x07) << 3) | (low >> 5);
-      uint8_t b5 = low & 0x1F;
-      uint8_t r = (r5 * 255) / 31;
-      uint8_t g = (g6 * 255) / 63;
-      uint8_t b = (b5 * 255) / 31;
-
-      // BMP pixel order is BGR (not RGB)
-      row_ptr[sx * 3 + 0] = b;
-      row_ptr[sx * 3 + 1] = g;
-      row_ptr[sx * 3 + 2] = r;
+        // BMP pixel order is BGR (not RGB)
+        row_ptr[sx * 3 + 0] = b;
+        row_ptr[sx * 3 + 1] = g;
+        row_ptr[sx * 3 + 2] = r;
+      }
     }
   }
 
-  ESP_LOGI(TAG, "Generated %dx%d BMP (%u bytes)", screen_w, screen_h, file_size);
+  ESP_LOGI(TAG, "Generated %dx%d %d-bit BMP (%u bytes)", screen_w, screen_h, bits_per_pixel, file_size);
 }
 
 }  // namespace display_capture

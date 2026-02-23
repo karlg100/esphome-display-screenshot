@@ -62,7 +62,8 @@ enum MemoryMode {
 /// HTTP handler that captures the display framebuffer as a BMP image.
 ///
 /// Registers two endpoints on the device's existing web server:
-///   GET /screenshot[?page=N]  -- returns a 24-bit BMP of the display
+///   GET /screenshot[?page=N]  -- returns a BMP of the display (24-bit preferred,
+///                                16-bit RGB565 fallback if memory is tight)
 ///   GET /screenshot/info      -- returns JSON metadata (page count, dimensions, mode)
 ///
 /// Thread safety: the /screenshot endpoint uses a binary semaphore to hand off
@@ -144,7 +145,7 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
   void handle_screenshot_(AsyncWebServerRequest *req);
   /// Handles GET /screenshot/info -- returns JSON, no semaphore needed.
   void handle_info_(AsyncWebServerRequest *req);
-  /// Reads the display buffer and generates a 24-bit BMP in configured memory.
+  /// Reads the display buffer and generates a BMP in configured memory.
   void generate_bmp_();
 
   /// Write a 32-bit value in little-endian byte order (for BMP headers).
