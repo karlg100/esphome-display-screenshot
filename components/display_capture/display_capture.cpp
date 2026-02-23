@@ -136,6 +136,51 @@ void DisplayCaptureHandler::handle_screenshot_(AsyncWebServerRequest *req) {
 
   if (xSemaphoreTake(this->semaphore_, pdMS_TO_TICKS(5000)) == pdTRUE) {
     if (this->stream_ready_ && !this->stream_failed_) {
+#ifdef USE_ESP_IDF
+      httpd_req_t *raw_req = *req;
+      if (httpd_resp_set_type(raw_req, "image/bmp") != ESP_OK ||
+          httpd_resp_set_hdr(raw_req, "Cache-Control", "no-cache") != ESP_OK) {
+        this->stream_restore_pending_ = true;
+        this->stream_in_progress_ = false;
+        req->send(500, "text/plain", "Failed to prepare screenshot response");
+        return;
+      }
+
+      size_t index = 0;
+      while (index < this->stream_file_size_) {
+        size_t len = this->stream_file_size_ - index;
+        if (len > STREAM_CHUNK_SIZE)
+          len = STREAM_CHUNK_SIZE;
+
+        // Clear any stale signal from a previous chunk/request.
+        (void) xSemaphoreTake(this->stream_chunk_done_, 0);
+        this->stream_chunk_index_ = index;
+        this->stream_chunk_len_ = len;
+        this->stream_chunk_requested_ = true;
+
+        if (xSemaphoreTake(this->stream_chunk_done_, pdMS_TO_TICKS(5000)) != pdTRUE ||
+            this->stream_chunk_filled_ == 0) {
+          this->stream_failed_ = true;
+          break;
+        }
+
+        if (httpd_resp_send_chunk(raw_req, reinterpret_cast<const char *>(this->stream_chunk_buf_),
+                                  this->stream_chunk_filled_) != ESP_OK) {
+          this->stream_failed_ = true;
+          break;
+        }
+
+        index += this->stream_chunk_filled_;
+      }
+
+      if (!this->stream_failed_) {
+        (void) httpd_resp_send_chunk(raw_req, nullptr, 0);
+      }
+
+      this->stream_restore_pending_ = true;
+      // Do not call req->send() after raw chunked response.
+      return;
+#else
       auto *response = req->beginResponse(
           "image/bmp",
           this->stream_file_size_,
@@ -176,6 +221,7 @@ void DisplayCaptureHandler::handle_screenshot_(AsyncWebServerRequest *req) {
           });
       response->addHeader("Cache-Control", "no-cache");
       req->send(response);
+#endif
     } else {
       this->stream_restore_pending_ = true;
       req->send(500, "text/plain", "Failed to capture screenshot");
