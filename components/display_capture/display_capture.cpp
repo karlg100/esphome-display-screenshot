@@ -136,8 +136,9 @@ void DisplayCaptureHandler::handle_screenshot_(AsyncWebServerRequest *req) {
 
   if (xSemaphoreTake(this->semaphore_, pdMS_TO_TICKS(5000)) == pdTRUE) {
     if (this->stream_ready_ && !this->stream_failed_) {
-      auto *response = req->beginChunkedResponse(
+      auto *response = req->beginResponse(
           "image/bmp",
+          this->stream_file_size_,
           [this](uint8_t *buffer, size_t max_len, size_t index) -> size_t {
             if (!this->stream_ready_ || this->stream_failed_)
               return 0;
