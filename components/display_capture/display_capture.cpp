@@ -12,11 +12,11 @@
 #define protected public
 #include "esphome/components/display/display_buffer.h"
 #include "esphome/components/display/display.h"
-#undef protected
 
 #ifdef USE_RPI_DPI_RGB
 #include "esphome/components/rpi_dpi_rgb/rpi_dpi_rgb.h"
 #endif
+#undef protected
 
 // --- Step 2: Our own header (uses only forward declarations, no buffer access) ---
 #include "display_capture.h"
