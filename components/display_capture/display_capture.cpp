@@ -12,11 +12,11 @@
 #define protected public
 #include "esphome/components/display/display_buffer.h"
 #include "esphome/components/display/display.h"
-#undef protected
 
 #ifdef USE_RPI_DPI_RGB
 #include "esphome/components/rpi_dpi_rgb/rpi_dpi_rgb.h"
 #endif
+#undef protected
 
 // --- Step 2: Our own header (uses only forward declarations, no buffer access) ---
 #include "display_capture.h"
@@ -31,6 +31,7 @@
 
 #include <esp_heap_caps.h>
 #include <cstring>
+#include <cinttypes>
 
 namespace esphome {
 namespace display_capture {
@@ -331,7 +332,7 @@ void DisplayCaptureHandler::generate_bmp_() {
   // Internal SRAM is only ~320 KB total and mostly used by the framework.
   this->bmp_data_ = (uint8_t *) heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
   if (this->bmp_data_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to allocate %u bytes in PSRAM for BMP", file_size);
+    ESP_LOGE(TAG, "Failed to allocate %" PRIu32 " bytes in PSRAM for BMP", file_size);
     this->bmp_size_ = 0;
     return;
   }
@@ -458,7 +459,7 @@ void DisplayCaptureHandler::generate_bmp_() {
     }
   }
 
-  ESP_LOGI(TAG, "Generated %dx%d BMP (%u bytes)", screen_w, screen_h, file_size);
+  ESP_LOGI(TAG, "Generated %dx%d BMP (%" PRIu32 " bytes)", screen_w, screen_h, file_size);
 }
 
 }  // namespace display_capture

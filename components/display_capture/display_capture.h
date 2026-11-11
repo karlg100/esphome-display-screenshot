@@ -99,11 +99,23 @@ class DisplayCaptureHandler : public AsyncWebHandler, public Component {
   bool canHandle(AsyncWebServerRequest *request) const override {
     if (request->method() != HTTP_GET)
       return false;
+#ifdef USE_ESP_IDF
+    char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
+    auto url = request->url_to(url_buf);
+    return url == "/screenshot" || url == "/screenshot/info";
+#else
     return request->url() == "/screenshot" || request->url() == "/screenshot/info";
+#endif
   }
 
   void handleRequest(AsyncWebServerRequest *req) override {
+#ifdef USE_ESP_IDF
+    char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
+    auto url = req->url_to(url_buf);
+    if (url == "/screenshot/info") {
+#else
     if (req->url() == "/screenshot/info") {
+#endif
       this->handle_info_(req);
       return;
     }

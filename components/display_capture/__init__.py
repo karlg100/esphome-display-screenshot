@@ -80,6 +80,9 @@ async def to_code(config):
     cg.add(var.set_display(disp))
     cg.add(var.set_backend(config[CONF_BACKEND]))
 
+    if config[CONF_BACKEND] == BACKEND_RPI_DPI_RGB:
+        cg.add_define("USE_RPI_DPI_RGB")
+
     # Native pages mode: resolve each DisplayPage ID and pass as a vector
     if CONF_PAGES in config:
         pages = []
